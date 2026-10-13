@@ -480,12 +480,7 @@ if (!function_exists('tinv_wishlist_get')) {
 			}
 
 			if (is_array($wishlist)) {
-				$wishlist['is_owner'] = false;
-				if (is_user_logged_in()) {
-					$wishlist['is_owner'] = get_current_user_id() == $wishlist['author']; // WPCS: loose comparison ok.
-				} else {
-					$wishlist['is_owner'] = $wl->get_sharekey() === $wishlist['share_key']; // WPCS: loose comparison ok.
-				}
+				$wishlist['is_owner'] = $wl->is_owner($wishlist);
 			}
 		} elseif (is_user_logged_in() && $toend) {
 			$wishlist = $wl->add_user_default();
@@ -495,11 +490,11 @@ if (!function_exists('tinv_wishlist_get')) {
 			$wishlist = $wl->get_by_sharekey_default();
 			if (!empty($wishlist)) {
 				$wishlist = array_shift($wishlist);
-				$wishlist['is_owner'] = $wl->get_sharekey() === $wishlist['share_key'];
+				$wishlist['is_owner'] = $wl->is_owner($wishlist);
 			}
 		}
 
-		return $wishlist;
+		return $wl->can_view($wishlist) ? $wishlist : null;
 	}
 } // End if().
 
@@ -583,7 +578,7 @@ if (!function_exists('tinv_url_wishlist')) {
 	function tinv_url_wishlist($id = '', $paged = 1, $full = true)
 	{
 		$share_key = $id;
-		if (!(is_string($id) && preg_match('/^[A-Fa-f0-9]{6}$/', $id))) {
+		if (!TInvWL_Wishlist::is_valid_share_key($id)) {
 			$wishlist = tinv_wishlist_get($id, false);
 			$share_key = isset($wishlist['share_key']) ? $wishlist['share_key'] : '';
 		}

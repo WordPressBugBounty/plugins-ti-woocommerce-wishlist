@@ -36,7 +36,7 @@ class TInvWL_Includes_API_Wishlist
 	{
 		register_rest_route(
 			$this->namespace,
-			'/' . $this->rest_base . '/get_by_share_key/(?P<share_key>[A-Fa-f0-9]{6})',
+			'/' . $this->rest_base . '/get_by_share_key/(?P<share_key>(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32}))',
 			array(
 				'methods' => WP_REST_Server::READABLE,
 				'callback' => array($this, 'wishlist_get_by_share_key'),
@@ -56,7 +56,7 @@ class TInvWL_Includes_API_Wishlist
 
 		register_rest_route(
 			$this->namespace,
-			'/' . $this->rest_base . '/update/(?P<share_key>[A-Fa-f0-9]{6})',
+			'/' . $this->rest_base . '/update/(?P<share_key>(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32}))',
 			array(
 				'methods' => WP_REST_Server::CREATABLE,
 				'callback' => array($this, 'wishlist_update'),
@@ -66,7 +66,7 @@ class TInvWL_Includes_API_Wishlist
 
 		register_rest_route(
 			$this->namespace,
-			'/' . $this->rest_base . '/(?P<share_key>[A-Fa-f0-9]{6})/get_products',
+			'/' . $this->rest_base . '/(?P<share_key>(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32}))/get_products',
 			array(
 				'methods' => WP_REST_Server::READABLE,
 				'callback' => array($this, 'wishlist_get_products'),
@@ -76,7 +76,7 @@ class TInvWL_Includes_API_Wishlist
 
 		register_rest_route(
 			$this->namespace,
-			'/' . $this->rest_base . '/(?P<share_key>[A-Fa-f0-9]{6})/add_product',
+			'/' . $this->rest_base . '/(?P<share_key>(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32}))/add_product',
 			array(
 				'methods' => WP_REST_Server::CREATABLE,
 				'callback' => array($this, 'wishlist_add_product'),
@@ -87,7 +87,7 @@ class TInvWL_Includes_API_Wishlist
 		// Hardened: share_key required and proper HTTP verb.
 		register_rest_route(
 			$this->namespace,
-			'/' . $this->rest_base . '/(?P<share_key>[A-Fa-f0-9]{6})/remove_product/(?P<item_id>[\d]+)',
+			'/' . $this->rest_base . '/(?P<share_key>(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32}))/remove_product/(?P<item_id>[\d]+)',
 			array(
 				'methods' => WP_REST_Server::DELETABLE,
 				'callback' => array($this, 'wishlist_remove_product'),
@@ -99,9 +99,7 @@ class TInvWL_Includes_API_Wishlist
 	/**
 	 * Permission callback for viewing a wishlist by share key.
 	 *
-	 * Public and shared wishlists can be read by anyone. A private wishlist is
-	 * only available to its logged-in owner, an administrator, or the browser
-	 * that owns a guest wishlist through its stored share-key cookie.
+	 * Use the wishlist's privacy policy, including signed guest ownership.
 	 *
 	 * @param WP_REST_Request $request Request object.
 	 *
@@ -114,25 +112,7 @@ class TInvWL_Includes_API_Wishlist
 			return $this->wishlist_not_found_error();
 		}
 
-		$wishlist = $result['wishlist'];
-		if ('private' !== $wishlist['status']) {
-			return true;
-		}
-
-		if (is_user_logged_in()) {
-			if (
-				(int) $wishlist['author'] === get_current_user_id()
-				|| current_user_can('tinvwl_general_settings')
-				|| current_user_can('manage_woocommerce')
-				|| current_user_can('manage_options')
-			) {
-				return true;
-			}
-		} elseif (empty($wishlist['author']) && $result['wl']->get_sharekey() === $wishlist['share_key']) {
-			return true;
-		}
-
-		return $this->wishlist_not_found_error();
+		return $result['wl']->can_view($result['wishlist']) ? true : $this->wishlist_not_found_error();
 	}
 
 	/**
@@ -146,7 +126,7 @@ class TInvWL_Includes_API_Wishlist
 	{
 		$share_key = $request->get_param('share_key');
 
-		if (empty($share_key) || !preg_match('/^[A-Fa-f0-9]{6}$/', $share_key)) {
+		if (!TInvWL_Wishlist::is_valid_share_key($share_key)) {
 			return new WP_Error(
 				'ti_woocommerce_wishlist_api_invalid_share_key',
 				__('Invalid wishlist share key.', 'ti-woocommerce-wishlist'),
@@ -157,11 +137,7 @@ class TInvWL_Includes_API_Wishlist
 		$wishlist = tinv_wishlist_get($share_key);
 
 		if (!$wishlist) {
-			return new WP_Error(
-				'ti_woocommerce_wishlist_api_invalid_share_key',
-				__('Invalid wishlist share key.', 'ti-woocommerce-wishlist'),
-				array('status' => 400)
-			);
+			return $this->wishlist_not_found_error();
 		}
 
 		$response = $this->prepare_wishlist_data($wishlist, 'get_by_share_key', $request->get_params());
@@ -455,7 +431,7 @@ class TInvWL_Includes_API_Wishlist
 	{
 		$share_key = $request->get_param('share_key');
 
-		if (empty($share_key) || !preg_match('/^[A-Fa-f0-9]{6}$/', $share_key)) {
+		if (!TInvWL_Wishlist::is_valid_share_key($share_key)) {
 			return new WP_Error(
 				'ti_woocommerce_wishlist_api_invalid_share_key',
 				__('Invalid wishlist share key.', 'ti-woocommerce-wishlist'),
@@ -467,11 +443,7 @@ class TInvWL_Includes_API_Wishlist
 		$wishlist = $wl->get_by_share_key($share_key);
 
 		if (!$wishlist) {
-			return new WP_Error(
-				'ti_woocommerce_wishlist_api_invalid_share_key',
-				__('Invalid wishlist share key.', 'ti-woocommerce-wishlist'),
-				array('status' => 400)
-			);
+			return $this->wishlist_not_found_error();
 		}
 
 		return array(
@@ -595,7 +567,7 @@ class TInvWL_Includes_API_Wishlist
 	 * - Requires elevated capability or ownership.
 	 *
 	 * For guest wishlists (author = 0):
-	 * - Requires valid share_key and a valid nonce in "tinvwl_nonce" param:
+	 * - Requires signed guest ownership and a valid nonce in "tinvwl_nonce" param:
 	 *   wp_verify_nonce( $nonce, 'tinvwl_wishlist_' . $share_key ).
 	 *
 	 * @param WP_REST_Request $request Request object.
@@ -617,10 +589,10 @@ class TInvWL_Includes_API_Wishlist
 		$wishlist = $result['wishlist'];
 		$share_key = $result['share_key'];
 
-		// Guest wishlist: allow modification if share_key is valid and nonce matches.
+		// A nonce prevents CSRF; it cannot establish guest ownership.
 		if (empty($wishlist['author'])) {
 			$nonce = $request->get_param('tinvwl_nonce');
-			if (empty($nonce) || !is_string($nonce) || !wp_verify_nonce($nonce, 'tinvwl_wishlist_' . $share_key)) {
+			if (!$result['wl']->is_owner($wishlist) || empty($nonce) || !is_string($nonce) || !wp_verify_nonce($nonce, 'tinvwl_wishlist_' . $share_key)) {
 				return new WP_Error(
 					'ti_woocommerce_wishlist_rest_forbidden',
 					__('You are not allowed to modify this wishlist.', 'ti-woocommerce-wishlist'),

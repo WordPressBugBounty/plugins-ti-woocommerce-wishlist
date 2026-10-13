@@ -93,14 +93,94 @@ class TInvWL_Wishlist
 	{
 		global $wpdb;
 
-		$share_key = substr(md5(date('r') . mt_rand(0, 3000)), 0, 6);
-		$unique = false;
-		while ($unique === false) {
-			$unique = !$wpdb->get_var($wpdb->prepare("SELECT `ID` FROM `{$this->table}` WHERE `share_key` = %s", $share_key));
-			$share_key = substr(md5(date('r') . mt_rand(0, 3000)), 0, 6);
-		}
+		do {
+			$share_key = bin2hex(random_bytes(16));
+		} while ($wpdb->get_var($wpdb->prepare("SELECT `ID` FROM `{$this->table}` WHERE `share_key` = %s", $share_key)));
 
 		return $share_key;
+	}
+
+	/**
+	 * Accept existing share links as well as new 128-bit keys.
+	 *
+	 * @param mixed $share_key Share key.
+	 * @return bool
+	 */
+	public static function is_valid_share_key($share_key)
+	{
+		return is_string($share_key) && 1 === preg_match('/\A(?:[a-f0-9]{6}|[a-f0-9]{32})\z/i', $share_key);
+	}
+
+	/**
+	 * Check ownership independently of the public share key and is_owner flag.
+	 *
+	 * @param array $wishlist Wishlist data.
+	 * @return bool
+	 */
+	public function is_owner($wishlist)
+	{
+		if (empty($wishlist['ID']) || !isset($wishlist['author'], $wishlist['share_key'])) {
+			return false;
+		}
+		if (!empty($wishlist['author'])) {
+			return is_user_logged_in() && (int) $wishlist['author'] === get_current_user_id();
+		}
+
+		$token = isset($_COOKIE['tinv_wishlist_owner']) ? $_COOKIE['tinv_wishlist_owner'] : '';
+		if (!is_string($token) || !preg_match('/\A([1-9][0-9]*)\.([0-9]{10})\.([a-f0-9]{64})\z/', $token, $parts)) {
+			return false;
+		}
+		if ((string) $wishlist['ID'] !== $parts[1] || (int) $parts[2] <= time()) {
+			return false;
+		}
+
+		return hash_equals($this->guest_owner_signature($wishlist, $parts[2]), $parts[3]);
+	}
+
+	/**
+	 * Apply the same privacy policy wherever a wishlist is read.
+	 *
+	 * @param array $wishlist Wishlist data.
+	 * @return bool
+	 */
+	public function can_view($wishlist)
+	{
+		if (empty($wishlist['ID']) || !isset($wishlist['status'])) {
+			return false;
+		}
+
+		return in_array($wishlist['status'], array('public', 'share'), true)
+			|| $this->is_owner($wishlist)
+			|| current_user_can('tinvwl_general_settings')
+			|| current_user_can('manage_woocommerce')
+			|| current_user_can('manage_options');
+	}
+
+	/**
+	 * Sign a guest credential bound to this wishlist and its expiration.
+	 */
+	private function guest_owner_signature($wishlist, $expires)
+	{
+		$data = $this->_name . '|guest-owner|' . $wishlist['ID'] . '|' . $wishlist['share_key'] . '|' . $expires;
+		return hash_hmac('sha256', $data, wp_salt('auth'));
+	}
+
+	/**
+	 * Only creation may issue a guest credential; a share-key lookup must not.
+	 */
+	private function set_guest_owner($wishlist)
+	{
+		$expires = time() + 31 * DAY_IN_SECONDS;
+		$token = $wishlist['ID'] . '.' . $expires . '.' . $this->guest_owner_signature($wishlist, $expires);
+		setcookie('tinv_wishlist_owner', $token, array(
+			'expires' => $expires,
+			'path' => COOKIEPATH ? COOKIEPATH : '/',
+			'domain' => COOKIE_DOMAIN ? COOKIE_DOMAIN : '',
+			'secure' => is_ssl(),
+			'httponly' => true,
+			'samesite' => 'Lax',
+		));
+		$_COOKIE['tinv_wishlist_owner'] = $token;
 	}
 
 	/**
@@ -204,6 +284,9 @@ class TInvWL_Wishlist
 		global $wpdb;
 		if ($wpdb->insert($this->table, $data)) { // @codingStandardsIgnoreLine WordPress.VIP.DirectDatabaseQuery.DirectQuery
 			$data['ID'] = $wpdb->insert_id;
+			if (empty($data['author']) && !is_user_logged_in()) {
+				$this->set_guest_owner($data);
+			}
 
 			/* Run a 3rd party code when a new wishlist created.
 			 *
@@ -257,7 +340,7 @@ class TInvWL_Wishlist
 		}
 
 		//validate sharekey
-		if (empty($sharekey) || !is_string($sharekey) || !preg_match('/[a-f0-9]{6}/i', $sharekey)) {
+		if (!self::is_valid_share_key($sharekey)) {
 			return array();
 		}
 
@@ -267,17 +350,8 @@ class TInvWL_Wishlist
 		);
 
 		$wishlists = $this->get($data);
-		// Prevent guests (or other users) from managing wishlists owned by a registered user via share key.
-		if (!empty($wishlists)) {
-			$first = reset($wishlists);
-			if (is_array($first) && !empty($first['author'])) {
-				$is_owner = is_user_logged_in() && (get_current_user_id() == $first['author']); // WPCS: loose comparison ok.
-				if (!$is_owner) {
-					return array();
-				}
-			}
-		}
-		return $wishlists;
+		// Default lists are used for writes and login transfers, not just viewing.
+		return array_values(array_filter($wishlists, array($this, 'is_owner')));
 	}
 
 	/**
@@ -323,7 +397,7 @@ class TInvWL_Wishlist
 		$wishlists = $this->get(array('ID' => $id));
 		$wishlist = array_shift($wishlists);
 
-		return $wishlist;
+		return $this->can_view($wishlist) ? $wishlist : null;
 	}
 
 	/**
@@ -335,25 +409,23 @@ class TInvWL_Wishlist
 	 */
 	function get_by_share_key($share_key)
 	{
-		if (empty($share_key) || !is_string($share_key) || !preg_match('/[a-f0-9]{6}/i', $share_key)) {
+		if (!self::is_valid_share_key($share_key)) {
 			return array();
 		}
 		$wishlists = $this->get(array('share_key' => $share_key));
 		$wishlist = array_shift($wishlists);
 		if (is_array($wishlist)) {
-			$wishlist['is_owner'] = false;
-			if (is_user_logged_in()) {
-				$wishlist['is_owner'] = get_current_user_id() == $wishlist['author']; // WPCS: loose comparison ok.
-			} else {
-				$wishlist['is_owner'] = $this->get_sharekey() === $wishlist['share_key']; // WPCS: loose comparison ok.
-			}
+			$wishlist['is_owner'] = $this->is_owner($wishlist);
 		}
 
-		return $wishlist;
+		return $this->can_view($wishlist) ? $wishlist : null;
 	}
 
 	/**
 	 * Get wishlist
+	 *
+	 * Low-level query for trusted internal callers. Request-controlled lookups
+	 * must use get_by_id() or get_by_share_key(), which enforce privacy.
 	 *
 	 * @param array $data Requset.
 	 *
@@ -453,11 +525,7 @@ class TInvWL_Wishlist
 			}
 
 			if (is_array($wl)) {
-				if (is_user_logged_in()) {
-					$wl['is_owner'] = get_current_user_id() == $wl['author']; // WPCS: loose comparison ok.
-				} else {
-					$wl['is_owner'] = $this->get_sharekey() === $wl['share_key']; // WPCS: loose comparison ok.
-				}
+				$wl['is_owner'] = $this->is_owner($wl);
 			}
 
 			$wls[$k] = apply_filters('tinvwl_wishlist_get', $wl);
@@ -501,8 +569,9 @@ class TInvWL_Wishlist
 		$data = array_filter($data);
 		$data = apply_filters('tinvwl_wishlist_update', $data, $id);
 		if (!array_key_exists('title', $data)) {
-			$wishlist = $this->get_by_id($id);
-			if ('default' === $wishlist['type']) {
+			// Internal updates may run without the owner's browser session.
+			$wishlist = $this->get(array('ID' => $id))[0] ?? null;
+			if ($wishlist && 'default' === $wishlist['type']) {
 				$data['title'] = '';
 			}
 		}
@@ -549,7 +618,7 @@ class TInvWL_Wishlist
 	{
 		global $tinvwl_wishlist_sharekey;
 
-		if (!empty($sharekey)) {
+		if (self::is_valid_share_key($sharekey)) {
 			self::$default_sharekey = $tinvwl_wishlist_sharekey = $sharekey;
 			@setcookie('tinv_wishlistkey', self::$default_sharekey, time() + 31 * DAY_IN_SECONDS, COOKIEPATH, COOKIE_DOMAIN);
 //			set_transient( '_tinvwl_update_wishlists_data', '1' );
@@ -570,7 +639,7 @@ class TInvWL_Wishlist
 		if (empty(self::$default_sharekey)) {
 			self::$default_sharekey = $tinvwl_wishlist_sharekey = filter_input(INPUT_COOKIE, 'tinv_wishlistkey', FILTER_VALIDATE_REGEXP, array(
 				'options' => array(
-					'regexp' => '/^[A-Fa-f0-9]{6}$/',
+					'regexp' => '/\A(?:[A-Fa-f0-9]{6}|[A-Fa-f0-9]{32})\z/',
 					'default' => $tinvwl_wishlist_sharekey,
 				),
 			));
